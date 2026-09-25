@@ -1,0 +1,247 @@
+import { isIP } from 'node:net'
+
+export type DNSSettingMode = 'none' | 'exec' | 'service'
+export type DNSWriteMode = Exclude<DNSSettingMode, 'none'>
+
+export interface DNSLifecycleState {
+  originDNS?: string
+  appliedDNS?: string
+  targetService?: string
+  appliedDNSMode?: DNSWriteMode
+}
+
+interface DNSLifecycleDependencies {
+  readState: () => Promise<DNSLifecycleState>
+  writeState: (state: DNSLifecycleState) => Promise<void>
+  getDefaultService: () => Promise<string>
+  readDNS: (service: string) => Promise<string>
+  writeDNS: (service: string, dns: string, mode: DNSWriteMode) => Promise<void>
+}
+
+interface RuntimeDNSConfig {
+  enable?: boolean
+  listen?: string
+}
+
+interface RuntimeTUNConfig {
+  enable?: boolean
+  'dns-hijack'?: string[]
+}
+
+interface RuntimeConfig {
+  dns?: RuntimeDNSConfig
+  tun?: RuntimeTUNConfig
+}
+
+interface RuntimeTUNStatus {
+  enable?: boolean
+  'inet4-address'?: string[]
+  'inet6-address'?: string[]
+}
+
+export function normalizeDNS(value: string): string {
+  const trimmed = value.trim()
+  if (
+    !trimmed ||
+    trimmed === 'Empty' ||
+    trimmed.startsWith("There aren't any DNS Servers set on")
+  ) {
+    return 'Empty'
+  }
+  return trimmed.split(/\s+/).join(' ')
+}
+
+function dnsValuesEqual(left: string, right: string): boolean {
+  const leftValues = normalizeDNS(left).toLowerCase().split(' ')
+  const rightValues = normalizeDNS(right).toLowerCase().split(' ')
+  return (
+    leftValues.length === rightValues.length &&
+    leftValues.every((value, index) => value === rightValues[index])
+  )
+}
+
+function parseHostPort(value: string): { host: string; port: number } | undefined {
+  const address = value.trim().replace(/^(?:udp|tcp):\/\//i, '')
+  let host: string
+  let portValue: string
+
+  if (address.startsWith('[')) {
+    const closingBracket = address.indexOf(']')
+    if (closingBracket < 0 || address[closingBracket + 1] !== ':') return undefined
+    host = address.slice(1, closingBracket)
+    portValue = address.slice(closingBracket + 2)
+  } else {
+    const separator = address.lastIndexOf(':')
+    if (separator < 0) return undefined
+    host = address.slice(0, separator)
+    portValue = address.slice(separator + 1)
+  }
+
+  if (!/^\d+$/.test(portValue)) return undefined
+  const port = Number(portValue)
+  if (port < 1 || port > 65535) return undefined
+  return { host, port }
+}
+
+function normalizeResolverHost(host: string): string | undefined {
+  if (host === '' || host === '*' || host === 'any' || host === '0.0.0.0') return '127.0.0.1'
+  if (host === '::') return '::1'
+  if (host.toLowerCase() === 'localhost') return '127.0.0.1'
+  return isIP(host) ? host : undefined
+}
+
+function getTunResolverAddress(tun: RuntimeTUNStatus): string | undefined {
+  for (const address of tun['inet4-address'] || []) {
+    const host = address.split('/')[0]
+    if (isIP(host) === 4) return host
+  }
+  for (const address of tun['inet6-address'] || []) {
+    const host = address.split('/')[0]
+    if (isIP(host) === 6) return host
+  }
+  return undefined
+}
+
+function getHijackedResolverAddress(hijack: string[]): string | undefined {
+  for (const entry of hijack) {
+    const listener = parseHostPort(entry)
+    if (!listener || listener.port !== 53) continue
+    const host = listener.host.toLowerCase()
+    if (host === '' || host === '*' || host === 'any' || host === '0.0.0.0' || host === '::') {
+      return undefined
+    }
+    const address = normalizeResolverHost(listener.host)
+    if (address) return address
+  }
+  return undefined
+}
+
+export function resolveSystemDnsTarget(
+  runtimeConfig: RuntimeConfig,
+  tunStatus?: RuntimeTUNStatus
+): string | undefined {
+  if (runtimeConfig.dns?.enable === false) return undefined
+
+  const listener = runtimeConfig.dns?.listen ? parseHostPort(runtimeConfig.dns.listen) : undefined
+  if (listener?.port === 53) {
+    const address = normalizeResolverHost(listener.host)
+    if (address) return address
+  }
+
+  if (!runtimeConfig.tun?.enable || !tunStatus?.enable) return undefined
+  const hijack = runtimeConfig.tun['dns-hijack'] || []
+  if (!hijack.some((entry) => parseHostPort(entry)?.port === 53)) return undefined
+
+  return getHijackedResolverAddress(hijack) || getTunResolverAddress(tunStatus)
+}
+
+export function runAfterCoreReady(
+  waitUntilReady: () => Promise<void>,
+  operation: () => Promise<void>
+): Promise<void> {
+  return waitUntilReady().then(operation)
+}
+
+export function createDNSLifecycle(dependencies: DNSLifecycleDependencies): {
+  apply: (target: string, mode: DNSSettingMode) => Promise<void>
+  recover: (mode?: DNSSettingMode) => Promise<void>
+} {
+  let operationQueue = Promise.resolve()
+
+  const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = operationQueue.then(operation, operation)
+    operationQueue = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
+  }
+
+  const hasState = (state: DNSLifecycleState): boolean =>
+    state.originDNS !== undefined ||
+    state.appliedDNS !== undefined ||
+    state.targetService !== undefined
+
+  const restoreState = async (state: DNSLifecycleState, mode: DNSSettingMode): Promise<void> => {
+    if (state.originDNS === undefined) return
+
+    const service = state.targetService || (await dependencies.getDefaultService())
+    const currentDNS = normalizeDNS(await dependencies.readDNS(service))
+    if (state.appliedDNS !== undefined && !dnsValuesEqual(currentDNS, state.appliedDNS)) return
+
+    const restoreModes = new Set<DNSWriteMode>([
+      state.appliedDNSMode || (mode === 'service' ? 'service' : 'exec'),
+      mode === 'service' ? 'service' : 'exec',
+      'exec'
+    ])
+    let lastError: unknown
+    for (const restoreMode of restoreModes) {
+      try {
+        await dependencies.writeDNS(service, state.originDNS, restoreMode)
+        return
+      } catch (error) {
+        lastError = error
+      }
+    }
+    throw lastError
+  }
+
+  const clearState = (): Promise<void> => dependencies.writeState({})
+
+  const recover = (mode: DNSSettingMode = 'none'): Promise<void> =>
+    serialize(async () => {
+      const state = await dependencies.readState()
+      if (!hasState(state)) return
+      await restoreState(state, mode)
+      await clearState()
+    })
+
+  const apply = (target: string, mode: DNSSettingMode): Promise<void> =>
+    serialize(async () => {
+      if (mode === 'none' || !target.trim()) return
+
+      let state = await dependencies.readState()
+      if (
+        hasState(state) &&
+        (state.originDNS === undefined || state.appliedDNS === undefined || !state.targetService)
+      ) {
+        await restoreState(state, mode)
+        await clearState()
+        state = {}
+      }
+
+      let service = await dependencies.getDefaultService()
+      if (state.targetService && state.targetService !== service) {
+        await restoreState(state, mode)
+        await clearState()
+        state = {}
+        service = await dependencies.getDefaultService()
+      }
+
+      const currentDNS = normalizeDNS(await dependencies.readDNS(service))
+      const previousStateIsApplied =
+        state.targetService === service &&
+        state.originDNS !== undefined &&
+        state.appliedDNS !== undefined &&
+        dnsValuesEqual(currentDNS, state.appliedDNS)
+      const originDNS = previousStateIsApplied ? state.originDNS! : currentDNS
+      const normalizedTarget = normalizeDNS(target)
+      const appliedMode =
+        previousStateIsApplied && dnsValuesEqual(currentDNS, normalizedTarget)
+          ? state.appliedDNSMode || mode
+          : mode
+
+      await dependencies.writeState({
+        originDNS,
+        appliedDNS: normalizedTarget,
+        targetService: service,
+        appliedDNSMode: appliedMode
+      })
+
+      if (!dnsValuesEqual(currentDNS, normalizedTarget)) {
+        await dependencies.writeDNS(service, normalizedTarget, mode)
+      }
+    })
+
+  return { apply, recover }
+}

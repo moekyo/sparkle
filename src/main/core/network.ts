@@ -1,23 +1,53 @@
 import { execFile } from 'child_process'
 import { net } from 'electron'
+import { Resolver } from 'node:dns/promises'
 import os from 'os'
 import { promisify } from 'util'
 import { getAppConfig, getControledMihomoConfig, patchAppConfig } from '../config'
 import { setSysDns } from '../service/api'
 import { triggerSysProxy } from '../sys/sysproxy'
 import { appendAppLog } from '../utils/log'
+import { getRuntimeConfig } from './factory'
+import { mihomoConfig } from './mihomoApi'
+import {
+  createDNSLifecycle,
+  normalizeDNS,
+  resolveSystemDnsTarget,
+  type DNSLifecycleState,
+  type DNSWriteMode
+} from './dns-lifecycle'
 
 export interface NetworkCoreController {
   shouldStartCore: (networkDownHandled: boolean) => boolean
   startCore: () => Promise<void>
   stopCore: () => Promise<void>
+  reconcileDNS?: () => Promise<void>
 }
 
-let setPublicDNSTimer: NodeJS.Timeout | null = null
-let recoverDNSTimer: NodeJS.Timeout | null = null
 let networkDetectionTimer: NodeJS.Timeout | null = null
 let networkDetectionGeneration = 0
 let networkDownHandled = false
+
+let lastDNSStatus = ''
+let networkDeviceHint: string | undefined
+
+const dnsLifecycle = createDNSLifecycle({
+  readState: async (): Promise<DNSLifecycleState> => {
+    const { originDNS, appliedDNS, targetService, appliedDNSMode } = await getAppConfig()
+    return { originDNS, appliedDNS, targetService, appliedDNSMode }
+  },
+  writeState: async (state) => {
+    await patchAppConfig({
+      originDNS: state.originDNS,
+      appliedDNS: state.appliedDNS,
+      targetService: state.targetService,
+      appliedDNSMode: state.appliedDNSMode
+    })
+  },
+  getDefaultService: () => getDefaultService(networkDeviceHint),
+  readDNS: getServiceDNS,
+  writeDNS: setDNS
+})
 
 export async function getDefaultDevice(): Promise<string> {
   const execFilePromise = promisify(execFile)
@@ -28,34 +58,71 @@ export async function getDefaultDevice(): Promise<string> {
   return device
 }
 
-async function getDefaultService(): Promise<string> {
+async function getDefaultService(deviceHint?: string): Promise<string> {
   const execFilePromise = promisify(execFile)
-  const device = await getDefaultDevice()
   const { stdout: order } = await execFilePromise('networksetup', ['-listnetworkserviceorder'])
-  const block = order.split('\n\n').find((s) => s.includes(`Device: ${device}`))
-  if (!block) throw new Error('Get networkservice failed')
-  for (const line of block.split('\n')) {
-    if (line.match(/^\(\d+\).*/)) {
-      return line.trim().split(' ').slice(1).join(' ')
-    }
+
+  const blocks = order.split(/\n\s*\n/)
+  if (deviceHint) {
+    const hintedBlock = blocks.find((item) => item.includes(`Device: ${deviceHint}`))
+    const hintedService = hintedBlock ? parseNetworkService(hintedBlock) : undefined
+    if (hintedService && !hintedService.disabled) return hintedService.name
   }
+
+  try {
+    const device = await getDefaultDevice()
+    const block = blocks.find((item) => item.includes(`Device: ${device}`))
+    const service = block ? parseNetworkService(block) : undefined
+    if (service && !service.disabled) return service.name
+  } catch {
+    // A running TUN can become the default route and hide the physical service.
+  }
+
+  const interfaces = os.networkInterfaces()
+  for (const block of blocks) {
+    const service = parseNetworkService(block)
+    const device = service?.device.toLowerCase() || ''
+    const virtualDevice = ['utun', 'bridge', 'awdl', 'llw', 'anpi', 'gif', 'stf', 'lo', 'ap'].some(
+      (prefix) => device.startsWith(prefix)
+    )
+    if (
+      !service ||
+      service.disabled ||
+      virtualDevice ||
+      !interfaces[service.device]?.some(
+        (iface) => !iface.internal && (iface.family === 'IPv4' || iface.family === 'IPv6')
+      )
+    ) {
+      continue
+    }
+    return service.name
+  }
+
   throw new Error('Get service failed')
 }
 
-async function getOriginDNS(): Promise<void> {
-  const execFilePromise = promisify(execFile)
-  const service = await getDefaultService()
-  const { stdout: dns } = await execFilePromise('networksetup', ['-getdnsservers', service])
-  if (dns.startsWith("There aren't any DNS Servers set on")) {
-    await patchAppConfig({ originDNS: 'Empty' })
-  } else {
-    await patchAppConfig({ originDNS: dns.trim().replace(/\n/g, ' ') })
+function parseNetworkService(
+  block: string
+): { name: string; device: string; disabled: boolean } | undefined {
+  const serviceMatch = block.match(/^\((\*|\d+)\)\s+(.+)$/m)
+  const deviceMatch = block.match(/Device:\s*([^,)]+)/)
+  if (!serviceMatch || !deviceMatch) return undefined
+  return {
+    name: serviceMatch[2].trim(),
+    device: deviceMatch[1].trim(),
+    disabled: serviceMatch[1] === '*'
   }
 }
 
-async function setDNS(dns: string, mode: 'none' | 'exec' | 'service'): Promise<void> {
-  const service = await getDefaultService()
-  const dnsServers = dns.split(' ')
+async function getServiceDNS(service: string): Promise<string> {
+  const execFilePromise = promisify(execFile)
+  const { stdout: dns } = await execFilePromise('networksetup', ['-getdnsservers', service])
+  return normalizeDNS(dns)
+}
+
+async function setDNS(service: string, dns: string, mode: DNSWriteMode): Promise<void> {
+  const normalizedDNS = normalizeDNS(dns)
+  const dnsServers = normalizedDNS === 'Empty' ? ['Empty'] : normalizedDNS.split(' ')
   if (mode === 'exec') {
     const execFilePromise = promisify(execFile)
     await execFilePromise('networksetup', ['-setdnsservers', service, ...dnsServers])
@@ -67,32 +134,108 @@ async function setDNS(dns: string, mode: 'none' | 'exec' | 'service'): Promise<v
   }
 }
 
-export async function setPublicDNS(): Promise<void> {
-  if (process.platform !== 'darwin') return
-  if (net.isOnline()) {
-    const { originDNS, autoSetDNSMode = 'none' } = await getAppConfig()
-    if (!originDNS) {
-      await getOriginDNS()
-      await setDNS('223.5.5.5', autoSetDNSMode)
-    }
-  } else {
-    if (setPublicDNSTimer) clearTimeout(setPublicDNSTimer)
-    setPublicDNSTimer = setTimeout(() => setPublicDNS(), 5000)
+async function isDNSResolverAvailable(address: string): Promise<boolean> {
+  const resolver = new Resolver()
+  try {
+    resolver.setServers([address])
+  } catch {
+    return false
   }
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (available: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(available)
+    }
+    const timer = setTimeout(() => {
+      resolver.cancel()
+      finish(false)
+    }, 1200)
+
+    resolver.resolve4('sparkle-dns-probe.invalid').then(
+      () => finish(true),
+      (error: NodeJS.ErrnoException) =>
+        finish(error.code === 'ENOTFOUND' || error.code === 'ENODATA')
+    )
+  })
+}
+
+async function waitForDNSResolver(address: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (await isDNSResolverAvailable(address)) return true
+    if (attempt < 3) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 250)
+      })
+    }
+  }
+  return false
+}
+
+function reportDNSStatus(status: string): void {
+  if (lastDNSStatus === status) return
+  lastDNSStatus = status
+  appendAppLog(`[Network]: ${status}\n`).catch(() => {})
+}
+
+export async function reconcileSystemDNS(): Promise<void> {
+  if (process.platform !== 'darwin') return
+
+  const { autoSetDNSMode = 'none' } = await getAppConfig()
+  if (autoSetDNSMode === 'none') {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    return
+  }
+  if (!net.isOnline()) {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    return
+  }
+
+  const runtimeConfig = await getRuntimeConfig()
+  if (!runtimeConfig?.tun?.enable || runtimeConfig.dns?.enable === false) {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    return
+  }
+
+  let liveConfig: ControllerConfigs
+  try {
+    liveConfig = await mihomoConfig()
+  } catch {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    reportDNSStatus('Mihomo controller is unavailable; restored managed DNS if needed')
+    return
+  }
+
+  if (!liveConfig?.tun?.enable) {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    return
+  }
+  networkDeviceHint = liveConfig['interface-name'] || undefined
+
+  const target = resolveSystemDnsTarget(runtimeConfig, liveConfig.tun)
+  if (!target) {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    reportDNSStatus('no reachable Mihomo DNS resolver is configured; system DNS was left unchanged')
+    return
+  }
+
+  if (!(await waitForDNSResolver(target))) {
+    await dnsLifecycle.recover(autoSetDNSMode)
+    reportDNSStatus(`Mihomo DNS resolver ${target} did not answer; system DNS was left unchanged`)
+    return
+  }
+
+  lastDNSStatus = ''
+  await dnsLifecycle.apply(target, autoSetDNSMode)
 }
 
 export async function recoverDNS(): Promise<void> {
   if (process.platform !== 'darwin') return
-  if (net.isOnline()) {
-    const { originDNS, autoSetDNSMode = 'none' } = await getAppConfig()
-    if (originDNS) {
-      await setDNS(originDNS, autoSetDNSMode)
-      await patchAppConfig({ originDNS: undefined })
-    }
-  } else {
-    if (recoverDNSTimer) clearTimeout(recoverDNSTimer)
-    recoverDNSTimer = setTimeout(() => recoverDNS(), 5000)
-  }
+  const { autoSetDNSMode = 'none' } = await getAppConfig()
+  await dnsLifecycle.recover(autoSetDNSMode)
 }
 
 export async function startNetworkDetectionController(
@@ -124,6 +267,8 @@ export async function startNetworkDetectionController(
           if (sysProxy.enable) await triggerSysProxy(true, onlyActiveDevice)
           networkDownHandled = false
         }
+        if (generation !== networkDetectionGeneration) return
+        await controller.reconcileDNS?.()
       } else if (!networkDownHandled) {
         if (sysProxy.enable) await triggerSysProxy(false, onlyActiveDevice, true)
         if (generation !== networkDetectionGeneration) return

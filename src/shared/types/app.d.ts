@@ -99,6 +99,9 @@ interface AppConfig {
   diffWorkDir?: boolean
   autoSetDNSMode?: 'none' | 'exec' | 'service'
   originDNS?: string
+  appliedDNS?: string
+  targetService?: string
+  appliedDNSMode?: 'exec' | 'service'
   useWindowFrame: boolean
   enableWindowDrag: boolean
   proxyInTray: boolean

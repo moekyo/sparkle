@@ -46,7 +46,8 @@ import {
 } from '../utils/notification'
 import { createCoreHookWaiter, createCoreStartupHook } from './startupHook'
 import { stopChildProcess } from './process-control'
-import { recoverDNS, setPublicDNS, startNetworkDetectionController } from './network'
+import { reconcileSystemDNS, recoverDNS, startNetworkDetectionController } from './network'
+import { runAfterCoreReady } from './dns-lifecycle'
 import { checkProfile } from './profile-check'
 import {
   createCoreEnvironment,
@@ -239,20 +240,31 @@ async function completeCoreInitialization(logLevel?: LogLevel): Promise<void> {
 
   await Promise.all(tasks)
   setMihomoLogSource('ws')
+  await runAfterCoreReady(waitForMihomoReady, async () => {
+    try {
+      await reconcileSystemDNS()
+    } catch (error) {
+      await appendAppLog(`[Manager]: set dns failed, ${error}\n`)
+    }
+  })
 }
 
 async function waitForMihomoReady(): Promise<void> {
   const maxRetries = 30
   const retryInterval = 100
+  let lastError: unknown
 
   for (let i = 0; i < maxRetries; i++) {
     try {
       await mihomoGroups()
-      break
+      return
     } catch (error) {
+      lastError = error
       await delay(retryInterval)
     }
   }
+
+  throw new Error(`Mihomo did not become ready: ${lastError}`)
 }
 
 async function waitForServiceCoreConnection(
@@ -333,7 +345,6 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
     serviceRunMode = 'auto',
     serviceCpuAffinity = [],
     coreStartupMode = 'post-up',
-    autoSetDNSMode = 'none',
     diffWorkDir = false,
     mihomoCpuPriority = 'PRIORITY_NORMAL',
     saveLogs = true,
@@ -344,7 +355,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
     disableNftables = false,
     safePaths = []
   } = appConfig
-  const { 'log-level': logLevel, tun } = controlledMihomoConfig
+  const { 'log-level': logLevel } = controlledMihomoConfig
   const { current } = profileConfig
   const useServiceCore = corePermissionMode === 'service' && !detached
 
@@ -382,13 +393,6 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
     await stopCore()
   }
   setMihomoLogSource('out')
-  if (tun?.enable && autoSetDNSMode !== 'none') {
-    try {
-      await setPublicDNS()
-    } catch (error) {
-      await appendAppLog(`[Manager]: set dns failed, ${error}\n`)
-    }
-  }
   const env = createCoreEnvironment({
     disableLoopbackDetector,
     disableEmbedCA,
@@ -537,7 +541,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
 
     if (isUpdaterFinishedLog(str)) {
       try {
-        await stopCore(true)
+        await stopCore()
         const promises = await startCore()
         await Promise.all(promises)
       } catch (e) {
@@ -612,13 +616,11 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
   return coreStartupMode === 'post-up' ? waitForCoreReadyByHook() : waitForCoreReadyByLog()
 }
 
-export async function stopCore(force = false): Promise<void> {
+export async function stopCore(): Promise<void> {
   serviceCoreRuntime.pauseAutoResume()
 
   try {
-    if (!force) {
-      await recoverDNS()
-    }
+    await recoverDNS()
   } catch (error) {
     await appendAppLog(`[Manager]: recover dns failed, ${error}\n`)
   }
@@ -780,6 +782,7 @@ export async function startNetworkDetection(): Promise<void> {
       const promises = await startCore()
       await Promise.all(promises)
     },
-    stopCore
+    stopCore,
+    reconcileDNS: reconcileSystemDNS
   })
 }
