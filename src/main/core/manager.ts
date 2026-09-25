@@ -20,13 +20,11 @@ import {
   mihomoGroups,
   getAxios
 } from './mihomoApi'
-import { readFile, rm, writeFile } from 'fs/promises'
+import { readFile, rename, rm, writeFile } from 'fs/promises'
 import { mainWindow } from '..'
 import path from 'path'
 import os from 'os'
-import { existsSync } from 'fs'
 import { uploadRuntimeConfig } from '../resolve/gistApi'
-import { startMonitor } from '../resolve/trafficMonitor'
 import {
   getCoreStatus,
   startCore as startServiceCore,
@@ -45,14 +43,26 @@ import {
   type AppNotificationVariant
 } from '../utils/notification'
 import { createCoreHookWaiter, createCoreStartupHook } from './startupHook'
-import { stopChildProcess } from './process-control'
+import {
+  isProcessCommandMatching,
+  processIsAlive,
+  readProcessIdentity,
+  stopChildProcess,
+  systemOwnedProcessControl
+} from './process-control'
 import {
   capturePhysicalNetworkOwner,
+  drainDNSLifecycle,
   reconcileSystemDNS,
   recoverDNS,
+  getDNSOwnerToken,
+  getDNSOwnershipSnapshot,
+  setDNSOwnerToken,
   startDNSReconciliationMonitor,
   startNetworkDetectionController,
-  stopDNSReconciliationMonitor
+  syncDetachedDNSOwnerSnapshot,
+  stopDNSReconciliationMonitor,
+  stopNetworkDetection
 } from './network'
 import { checkProfile } from './profile-check'
 import {
@@ -72,6 +82,9 @@ import {
   type CoreStartOptions,
   type CoreStopOptions
 } from './core-lifecycle'
+import { createDNSOwnerToken, sameDNSOwner, type DNSOwnerToken } from './dns-owner'
+import { dnsOwnerStore } from './dns-owner-store'
+import { createDNSOwnerCoordinator } from './dns-owner-coordinator'
 
 const ctlParam = process.platform === 'win32' ? '-ext-ctl-pipe' : '-ext-ctl-unix'
 
@@ -262,17 +275,13 @@ async function completeCoreInitialization(logLevel?: LogLevel): Promise<void> {
   void Promise.all(tasks).catch((error) => {
     appendAppLog(`[Manager]: post-start tasks failed, ${error}\n`).catch(() => {})
   })
-  await reconcileDNSWhenControllerReady(
-    waitForMihomoReady,
-    reconcileSystemDNS,
-    (error) => {
-      appendAppLog(
-        error
-          ? `[Manager]: DNS reconcile deferred, ${error}\n`
-          : '[Manager]: controller not ready; DNS reconcile deferred\n'
-      ).catch(() => {})
-    }
-  )
+  await reconcileDNSWhenControllerReady(waitForMihomoReady, reconcileSystemDNS, (error) => {
+    appendAppLog(
+      error
+        ? `[Manager]: DNS reconcile deferred, ${error}\n`
+        : '[Manager]: controller not ready; DNS reconcile deferred\n'
+    ).catch(() => {})
+  })
   startDNSReconciliationMonitor()
 }
 
@@ -356,7 +365,31 @@ async function getServiceStatusAfterConnectionError(): Promise<
   }
 }
 
-export async function startCore(options: CoreStartOptions = {}): Promise<Promise<void>[]> {
+interface PreparedCoreStart {
+  options: CoreStartOptions
+  appConfig: AppConfig
+  logLevel?: LogLevel
+  corePath: string
+  serviceCoreRunning: boolean
+  detached: boolean
+  preserveDNSOwnership: boolean
+  requiresDNS: boolean
+  useServiceCore: boolean
+  env: Record<string, string | undefined>
+  safePaths: string[]
+  coreHook?: Awaited<ReturnType<typeof createCoreStartupHook>>
+  hookWaiter?: ReturnType<typeof createCoreHookWaiter>
+  spawnArgs: string[]
+  providerTracker: ReturnType<typeof createProviderInitializationTracker>
+}
+
+type CorePreparationResult =
+  { kind: 'ready'; prepared: PreparedCoreStart } | { kind: 'service-fallback'; error: unknown }
+
+async function prepareCoreStart(
+  options: CoreStartOptions,
+  profilePrepared = false
+): Promise<CorePreparationResult> {
   const detached = options.mode === 'detached'
   const preserveDNSOwnership = options.dnsOwnership === 'preserve' || detached
   const [appConfig, controlledMihomoConfig, profileConfig] = await Promise.all([
@@ -367,13 +400,8 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
   const {
     core = 'mihomo',
     corePermissionMode = 'elevated',
-    serviceRunMode = 'auto',
-    serviceCpuAffinity = [],
     coreStartupMode = 'post-up',
     diffWorkDir = false,
-    mihomoCpuPriority = 'PRIORITY_NORMAL',
-    saveLogs = true,
-    maxLogFileSizeMB = 20,
     disableLoopbackDetector = false,
     disableEmbedCA = false,
     disableSystemCA = false,
@@ -390,12 +418,12 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
   } catch (error) {
     if (core === 'system' && !systemCoreOnlyBuild) {
       await patchAppConfig({ core: 'mihomo' })
-      return startCore(options)
+      return prepareCoreStart(options, profilePrepared)
     }
     throw error
   }
 
-  await generateProfile()
+  if (!profilePrepared) await generateProfile()
   if (useServiceCore || detached) {
     await checkProfile()
   }
@@ -413,18 +441,12 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
       if (isServiceUnavailableError(error)) {
         const probe = await waitForServiceCoreConnection(error)
         if (!probe.reachable) {
-          return serviceCoreRuntime.fallbackToElevatedCore(options, probe.error)
+          return { kind: 'service-fallback', error: probe.error }
         }
         serviceCoreRunning = probe.running
       }
     }
   }
-  if (!serviceCoreRunning && options.existingCore !== 'already-stopped') {
-    await stopCore({ dnsOwnership: preserveDNSOwnership ? 'preserve' : 'restore' })
-  } else if (options.existingCore === 'already-stopped') {
-    stopDNSReconciliationMonitor()
-  }
-  setMihomoLogSource('out')
   const env = createCoreEnvironment({
     disableLoopbackDetector,
     disableEmbedCA,
@@ -433,7 +455,6 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
     safePaths
   })
 
-  let initialized = false
   const coreHook =
     !useServiceCore && !detached && coreStartupMode === 'post-up'
       ? await createCoreStartupHook()
@@ -453,6 +474,173 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
     ctlParam,
     coreHook
   })
+
+  const runtimeConfig = await getRuntimeConfig()
+  const providerTracker = createProviderInitializationTracker(runtimeConfig)
+  return {
+    kind: 'ready',
+    prepared: {
+      options,
+      appConfig,
+      logLevel,
+      corePath,
+      serviceCoreRunning,
+      detached,
+      preserveDNSOwnership,
+      requiresDNS:
+        detached &&
+        Boolean(appConfig.autoSetDNSMode && appConfig.autoSetDNSMode !== 'none') &&
+        runtimeConfig.tun?.enable === true &&
+        runtimeConfig.dns?.enable !== false,
+      useServiceCore,
+      env,
+      safePaths,
+      coreHook,
+      hookWaiter,
+      spawnArgs,
+      providerTracker
+    }
+  }
+}
+
+export async function startCore(options: CoreStartOptions = {}): Promise<Promise<void>[]> {
+  if (options.mode !== 'detached') await ensureManagedDNSOwner()
+  const preparation = await prepareCoreStart(options)
+  if (preparation.kind === 'service-fallback') {
+    return serviceCoreRuntime.fallbackToElevatedCore(options, preparation.error)
+  }
+  return startPreparedCore(preparation.prepared)
+}
+
+async function ensureManagedDNSOwner(): Promise<DNSOwnerToken> {
+  const store = dnsOwnerStore()
+  const coordinator = createDNSOwnerCoordinator({
+    store,
+    isProcessAlive: async (pid) => processIsAlive(pid),
+    isOwnerProcessAlive: async (owner) =>
+      !!owner.startedAt &&
+      processIsAlive(owner.pid) &&
+      readProcessIdentity(owner.pid) === owner.startedAt,
+    getProcessIdentity: async (pid) => readProcessIdentity(pid),
+    isGuardianAlive: async (record) => {
+      const guardianPid = record.detached?.guardianPid
+      const generation = record.detached?.generation
+      return !!(
+        guardianPid &&
+        generation &&
+        processIsAlive(guardianPid) &&
+        isProcessCommandMatching(guardianPid, `--sparkle-dns-guardian=${generation}`)
+      )
+    },
+    requestGuardianRelease: async (record) => {
+      const detached = record.detached
+      if (!detached) throw new Error('Detached DNS guardian state is missing')
+      const request = {
+        type: 'relaunch' as const,
+        requestId: createDNSOwnerToken('detached-guardian').generation,
+        requestedBy: process.pid
+      }
+      const deadline = Date.now() + 30000
+      while (Date.now() < deadline) {
+        const current = await store.read()
+        if (
+          !current ||
+          current.detached?.generation !== detached.generation ||
+          !sameDNSOwner(current.owner, record.owner)
+        ) {
+          return
+        }
+        if (!processIsAlive(detached.guardianPid)) return
+        await store.write({
+          ...current,
+          detached: { ...current.detached, request }
+        })
+        await delay(200)
+      }
+      throw new Error('Timed out waiting for the detached DNS guardian to release ownership')
+    },
+    stopDetachedCore: async (record) => {
+      const detached = record.detached
+      if (!detached?.corePid) return
+      if (!detached.coreStartedAt) {
+        throw new Error('Detached core identity is missing; refusing to signal an unknown process')
+      }
+      await systemOwnedProcessControl().stop(detached.corePid, detached.coreStartedAt)
+      await removeCorePid(detached.corePid)
+    },
+    recoverDNS: (owner) => recoverDNS(owner)
+  })
+  const owner = await coordinator.acquireManagedOwner(process.pid)
+  setDNSOwnerToken(owner)
+  return owner
+}
+
+async function writeCorePid(pid: number): Promise<void> {
+  const filePath = path.join(dataDir(), 'core.pid')
+  const temporaryPath = `${filePath}.${process.pid}.tmp`
+  await writeFile(temporaryPath, `${pid}\n`, { mode: 0o600 })
+  await rename(temporaryPath, filePath)
+}
+
+async function removeCorePid(expectedPid?: number): Promise<void> {
+  const filePath = path.join(dataDir(), 'core.pid')
+  try {
+    const currentPid = Number.parseInt((await readFile(filePath, 'utf8')).trim(), 10)
+    if (
+      !Number.isInteger(currentPid) ||
+      (expectedPid !== undefined && currentPid !== expectedPid)
+    ) {
+      return
+    }
+    await rm(filePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+async function startPreparedCore(
+  prepared: PreparedCoreStart,
+  onSpawn?: (pid: number) => Promise<void>
+): Promise<Promise<void>[]> {
+  const {
+    options,
+    appConfig,
+    logLevel,
+    corePath,
+    serviceCoreRunning,
+    detached,
+    preserveDNSOwnership,
+    useServiceCore,
+    env,
+    safePaths,
+    coreHook,
+    hookWaiter,
+    spawnArgs,
+    providerTracker
+  } = prepared
+  const {
+    serviceRunMode = 'auto',
+    serviceCpuAffinity = [],
+    mihomoCpuPriority = 'PRIORITY_NORMAL',
+    saveLogs = true,
+    maxLogFileSizeMB = 20,
+    coreStartupMode = 'post-up'
+  } = appConfig
+  let initialized = false
+
+  if (!serviceCoreRunning && options.existingCore !== 'already-stopped') {
+    await stopCore({ dnsOwnership: preserveDNSOwnership ? 'preserve' : 'restore' })
+  } else if (options.existingCore === 'already-stopped') {
+    stopDNSReconciliationMonitor()
+  }
+  setMihomoLogSource('out')
+  if (coreHook) {
+    await appendAppLog(
+      `[Manager]: Core startup mode: post-up, post-up command: ${coreHook.postUpCommand}\n`
+    )
+  } else if (!detached) {
+    await appendAppLog(`[Manager]: Core startup mode: log\n`)
+  }
 
   if (useServiceCore) {
     const serviceProfile: ServiceCoreLaunchProfile = {
@@ -502,7 +690,6 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
     return [completeCoreInitialization(logLevel)]
   }
 
-  const providerTracker = createProviderInitializationTracker(await getRuntimeConfig())
   const stdout = createLogWritable('core', 'info')
   const stderr = createLogWritable('core', 'error')
   directCoreState.logLineBuffer = ''
@@ -546,27 +733,25 @@ export async function startCore(options: CoreStartOptions = {}): Promise<Promise
   }
   if (detached) {
     child.unref()
-    child.once('close', async (code, signal) => {
-      const wasCurrentDetachedCore =
-        directCoreState.child === child && directCoreState.detached
+    child.once('close', (code, signal) => {
       if (directCoreState.child === child) {
         directCoreState.child = undefined
         directCoreState.detached = false
       }
-      if (wasCurrentDetachedCore) {
-        await appendAppLog(`[Manager]: Detached core closed, code: ${code}, signal: ${signal}\n`)
-        try {
-          await recoverDNS()
-        } catch (error) {
-          await appendAppLog(`[Manager]: recover dns after detached core exit failed, ${error}\n`)
-        }
-      }
+      appendAppLog(`[Manager]: Detached core closed, code: ${code}, signal: ${signal}\n`).catch(
+        () => {}
+      )
     })
     const childExited = new Promise<never>((_resolve, reject) => {
       child.once('close', (code, signal) => {
         reject(startupFailure(`code: ${code}, signal: ${signal}`))
       })
     })
+    void childExited.catch(() => {})
+    if (onSpawn) {
+      if (!child.pid) throw new Error('Detached core process did not receive a PID')
+      await onSpawn(child.pid)
+    }
     const controllerReady = waitForControllerReady(() => mihomoGroups(), {
       maxRetries: 100,
       retryIntervalMs: 100,
@@ -704,6 +889,8 @@ export async function stopCore(options: CoreStopOptions = {}): Promise<void> {
     } catch (error) {
       await appendAppLog(`[Manager]: recover dns failed, ${error}\n`)
     }
+  } else {
+    await drainDNSLifecycle()
   }
 
   serviceCoreRuntime.clearStreams()
@@ -730,25 +917,21 @@ export async function stopCore(options: CoreStopOptions = {}): Promise<void> {
 
   await getAxios(true).catch(() => {})
 
-  if (existsSync(path.join(dataDir(), 'core.pid'))) {
-    const pidString = await readFile(path.join(dataDir(), 'core.pid'), 'utf-8')
-    const pid = parseInt(pidString.trim())
-    if (!isNaN(pid)) {
-      try {
-        process.kill(pid, 0)
-        process.kill(pid, 'SIGINT')
-        await delay(1000)
-        try {
-          process.kill(pid, 0)
-          process.kill(pid, 'SIGKILL')
-        } catch {
-          // ignore
-        }
-      } catch {
-        // ignore
-      }
+  try {
+    const pid = Number.parseInt(
+      (await readFile(path.join(dataDir(), 'core.pid'), 'utf8')).trim(),
+      10
+    )
+    const ownerRecord = await dnsOwnerStore().read()
+    const detached = ownerRecord?.detached
+    if (Number.isInteger(pid) && detached?.corePid === pid && detached.coreStartedAt) {
+      await systemOwnedProcessControl().stop(pid, detached.coreStartedAt)
     }
-    await rm(path.join(dataDir(), 'core.pid')).catch(() => {})
+    await removeCorePid(Number.isInteger(pid) ? pid : undefined)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      await appendAppLog(`[Manager]: detached core cleanup failed, ${error}\n`)
+    }
   }
 }
 
@@ -835,37 +1018,306 @@ export async function restartCore(): Promise<void> {
   }
 }
 
+let detachedHandoffInProgress = false
+
 export async function keepCoreAlive(): Promise<void> {
   const { corePermissionMode = 'elevated' } = await getAppConfig()
   if (corePermissionMode === 'service') return
+  if (detachedHandoffInProgress) throw new Error('Detached core handoff is already in progress')
+  detachedHandoffInProgress = true
 
-  await runDetachedCoreDNSHandoff({
-    stopManagedCorePreservingDNS: () => stopCore({ dnsOwnership: 'preserve' }),
-    startDetachedCore: async () => {
-      const promises = await startCore({
-        mode: 'detached',
-        dnsOwnership: 'preserve',
-        existingCore: 'already-stopped',
-        reconcileDNSAfterReady: false
-      })
-      await Promise.all(promises)
-    },
-    reconcileDNS: async () => {
-      if (!directCoreState.detached || !directCoreState.child) return { kind: 'not-ready' }
-      const outcome = await reconcileSystemDNS()
-      return directCoreState.detached && directCoreState.child ? outcome : { kind: 'not-ready' }
-    },
-    stopDetachedCorePreservingDNS: () => stopCore({ dnsOwnership: 'preserve' }),
-    recoverDNS,
-    commitHandoff: async () => {
-      const pid = directCoreState.child?.pid
-      if (!pid || !directCoreState.detached) throw new Error('Detached core exited before handoff')
-      await writeFile(path.join(dataDir(), 'core.pid'), pid.toString())
-    },
-    onCleanupError: (error) => {
-      appendAppLog(`[Manager]: detached core handoff cleanup failed, ${error}\n`).catch(() => {})
+  try {
+    const previousOwner = getDNSOwnerToken()
+    const managedOwner = await ensureManagedDNSOwner()
+    if (previousOwner && !sameDNSOwner(previousOwner, managedOwner)) {
+      throw new Error('Managed DNS owner changed before detached handoff')
     }
-  })
+    const managedOwnerStartedAt = readProcessIdentity(process.pid)
+    if (!managedOwnerStartedAt) throw new Error('Unable to identify the managed DNS owner process')
+    const managedOwnerRecord = {
+      ...managedOwner,
+      pid: process.pid,
+      startedAt: managedOwnerStartedAt
+    }
+    const guardianOwner = createDNSOwnerToken('detached-guardian')
+    const store = dnsOwnerStore()
+    let guardianProcess: ChildProcess | undefined
+    let guardianSpawnError: Error | undefined
+    let detachedCorePid: number | undefined
+    let managedRollbackPrepared: PreparedCoreStart | undefined
+
+    const prepare = async (
+      options: CoreStartOptions,
+      profilePrepared = false
+    ): Promise<PreparedCoreStart> => {
+      const result = await prepareCoreStart(options, profilePrepared)
+      if (result.kind === 'service-fallback') {
+        throw new Error(`Unable to prepare detached core: ${result.error}`)
+      }
+      return result.prepared
+    }
+
+    await runDetachedCoreDNSHandoff({
+      prepareDetachedCore: async () => {
+        const detachedPrepared = await prepare({
+          mode: 'detached',
+          dnsOwnership: 'preserve',
+          existingCore: 'already-stopped',
+          reconcileDNSAfterReady: false
+        })
+        managedRollbackPrepared = await prepare(
+          {
+            mode: 'managed',
+            dnsOwnership: 'preserve',
+            existingCore: 'already-stopped'
+          },
+          true
+        )
+        return detachedPrepared
+      },
+      requiresDNS: (prepared) => prepared.requiresDNS,
+      prepareGuardian: async () => {
+        const ownerRecord = await store.read()
+        if (!ownerRecord || !sameDNSOwner(ownerRecord.owner, managedOwner)) {
+          throw new Error('Managed DNS ownership changed before detached handoff')
+        }
+        const dnsSnapshot = await getDNSOwnershipSnapshot()
+        await store.write({
+          version: 1,
+          owner: managedOwnerRecord,
+          detached: {
+            ...dnsSnapshot,
+            generation: guardianOwner.generation,
+            guardianPid: 0,
+            status: 'preparing',
+            ready: false
+          }
+        })
+
+        const marker = `--sparkle-dns-guardian=${guardianOwner.generation}`
+        guardianProcess = spawn(process.execPath, [app.getAppPath(), marker], {
+          detached: true,
+          stdio: 'ignore',
+          env: process.env
+        })
+        guardianProcess.once('error', (error) => {
+          guardianSpawnError = error
+        })
+        guardianProcess.unref()
+        const guardianPid = guardianProcess.pid
+        if (!guardianPid) throw new Error('DNS guardian process did not receive a PID')
+
+        const current = await store.read()
+        if (
+          !current ||
+          !sameDNSOwner(current.owner, managedOwner) ||
+          current.detached?.generation !== guardianOwner.generation
+        ) {
+          throw new Error('DNS guardian registration was replaced during startup')
+        }
+        await store.write({
+          ...current,
+          detached: { ...current.detached, guardianPid }
+        })
+
+        const deadline = Date.now() + 15000
+        while (Date.now() < deadline) {
+          if (guardianSpawnError) throw guardianSpawnError
+          if (guardianProcess.exitCode !== null || guardianProcess.signalCode !== null) {
+            throw new Error('DNS guardian exited before becoming ready')
+          }
+          const registration = await store.read()
+          if (
+            registration?.detached?.generation !== guardianOwner.generation ||
+            !sameDNSOwner(registration.owner, managedOwner)
+          ) {
+            throw new Error('DNS guardian registration was lost')
+          }
+          if (
+            registration.detached.ready &&
+            registration.detached.guardianPid === guardianPid &&
+            processIsAlive(guardianPid) &&
+            isProcessCommandMatching(guardianPid, marker)
+          ) {
+            return
+          }
+          await delay(100)
+        }
+        throw new Error('Timed out waiting for the detached DNS guardian to become ready')
+      },
+      stopManagedCorePreservingDNS: async () => {
+        stopNetworkDetection()
+        await stopCore({ dnsOwnership: 'preserve' })
+      },
+      startDetachedCore: async (prepared) => {
+        const startPromises = await startPreparedCore(prepared, async (pid) => {
+          detachedCorePid = pid
+          const record = await store.read()
+          if (
+            !record ||
+            !sameDNSOwner(record.owner, managedOwner) ||
+            record.detached?.generation !== guardianOwner.generation
+          ) {
+            throw new Error('Detached core started after DNS guardian ownership was lost')
+          }
+          await store.write({
+            ...record,
+            detached: { ...record.detached, corePid: pid, corePath: prepared.corePath }
+          })
+
+          let startedAt: string | undefined
+          for (let attempt = 0; attempt < 20 && !startedAt; attempt++) {
+            startedAt = readProcessIdentity(pid)
+            if (!startedAt) await delay(50)
+          }
+          if (!startedAt) throw new Error('Unable to identify the detached core process')
+          const identified = await store.read()
+          if (
+            !identified ||
+            !sameDNSOwner(identified.owner, managedOwner) ||
+            identified.detached?.generation !== guardianOwner.generation
+          ) {
+            throw new Error('Detached core identity was not persisted under the active handoff')
+          }
+          await store.write({
+            ...identified,
+            detached: { ...identified.detached, coreStartedAt: startedAt }
+          })
+        })
+        await Promise.all(startPromises)
+      },
+      reconcileDNS: async () => {
+        if (!directCoreState.detached || !directCoreState.child) return { kind: 'not-ready' }
+        const outcome = await reconcileSystemDNS(managedOwner)
+        return directCoreState.detached && directCoreState.child ? outcome : { kind: 'not-ready' }
+      },
+      registerGuardian: async () => {
+        const record = await store.read()
+        if (
+          !record ||
+          !sameDNSOwner(record.owner, managedOwner) ||
+          record.detached?.generation !== guardianOwner.generation ||
+          !record.detached.ready ||
+          !record.detached.corePid ||
+          !record.detached.coreStartedAt
+        ) {
+          throw new Error('Detached DNS guardian is not durably registered')
+        }
+        await drainDNSLifecycle()
+        await syncDetachedDNSOwnerSnapshot(managedOwner)
+      },
+      stopDetachedCorePreservingDNS: async () => {
+        await stopCore({ dnsOwnership: 'preserve' })
+        await removeCorePid(detachedCorePid)
+      },
+      recoverDNS: () => recoverDNS(managedOwner),
+      revokeGuardian: async () => {
+        const current = await store.read()
+        if (current?.detached?.generation === guardianOwner.generation) {
+          await store.write({
+            version: 1,
+            owner: managedOwnerRecord
+          })
+        }
+        setDNSOwnerToken(managedOwner)
+        const guardianPid = guardianProcess?.pid
+        if (
+          guardianPid &&
+          processIsAlive(guardianPid) &&
+          isProcessCommandMatching(
+            guardianPid,
+            `--sparkle-dns-guardian=${guardianOwner.generation}`
+          )
+        ) {
+          try {
+            process.kill(guardianPid, 'SIGTERM')
+          } catch {
+            // The guardian may have exited after registration was inspected.
+          }
+          const deadline = Date.now() + 2000
+          while (processIsAlive(guardianPid) && Date.now() < deadline) await delay(50)
+          if (processIsAlive(guardianPid)) {
+            throw new Error('Unable to stop the standby DNS guardian during rollback')
+          }
+        }
+      },
+      rollbackManagedCore: async () => {
+        setDNSOwnerToken(managedOwner)
+        if (directCoreState.child && directCoreState.detached) {
+          throw new Error('Detached replacement is still running; managed core rollback is unsafe')
+        }
+        if (directCoreState.child) {
+          const outcome = await reconcileSystemDNS(managedOwner)
+          if (outcome.kind === 'not-ready' || outcome.kind === 'stale') {
+            throw new Error('Managed core survived handoff but DNS could not be reconciled')
+          }
+          startDNSReconciliationMonitor()
+        } else {
+          if (!managedRollbackPrepared) throw new Error('Managed core rollback was not prepared')
+          const promises = await startPreparedCore(managedRollbackPrepared)
+          await Promise.all(promises)
+        }
+        if ((await getAppConfig()).networkDetection) await startNetworkDetection()
+      },
+      clearHandoffArtifacts: async () => {
+        await removeCorePid(detachedCorePid)
+        const current = await store.read()
+        if (current?.detached?.generation === guardianOwner.generation) {
+          await store.write({
+            version: 1,
+            owner: managedOwnerRecord
+          })
+        }
+      },
+      commitHandoff: async () => {
+        const guardianPid = guardianProcess?.pid
+        const guardianStartedAt = guardianPid ? readProcessIdentity(guardianPid) : undefined
+        const record = await store.read()
+        if (
+          !detachedCorePid ||
+          !directCoreState.detached ||
+          directCoreState.child?.pid !== detachedCorePid ||
+          !processIsAlive(detachedCorePid) ||
+          !guardianPid ||
+          !guardianStartedAt ||
+          !processIsAlive(guardianPid) ||
+          !isProcessCommandMatching(
+            guardianPid,
+            `--sparkle-dns-guardian=${guardianOwner.generation}`
+          ) ||
+          !record ||
+          !sameDNSOwner(record.owner, managedOwner) ||
+          record.detached?.generation !== guardianOwner.generation ||
+          !record.detached.ready ||
+          !record.detached.coreStartedAt ||
+          readProcessIdentity(detachedCorePid) !== record.detached.coreStartedAt
+        ) {
+          throw new Error('Detached core or DNS guardian exited before ownership commit')
+        }
+        await drainDNSLifecycle()
+        stopDNSReconciliationMonitor()
+        await writeCorePid(detachedCorePid)
+        const dnsSnapshot = await getDNSOwnershipSnapshot()
+        await store.write({
+          ...record,
+          owner: { ...guardianOwner, pid: guardianPid, startedAt: guardianStartedAt },
+          detached: {
+            ...record.detached,
+            ...dnsSnapshot,
+            status: 'active',
+            ready: true,
+            request: undefined
+          }
+        })
+        setDNSOwnerToken(undefined)
+      },
+      onCleanupError: (error) => {
+        appendAppLog(`[Manager]: detached core handoff cleanup failed, ${error}\n`).catch(() => {})
+      }
+    })
+  } finally {
+    detachedHandoffInProgress = false
+  }
 }
 
 export async function quitWithoutCore(): Promise<void> {
@@ -875,7 +1327,6 @@ export async function quitWithoutCore(): Promise<void> {
     void showNotification({ title: '内核启动出错', body: `${error}`, variant: 'danger' })
     return
   }
-  await startMonitor(true)
   app.exit()
 }
 

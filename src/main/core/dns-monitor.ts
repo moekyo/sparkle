@@ -18,6 +18,7 @@ export function createDNSLifecycleMonitor(options: {
   initialPhysicalOwner: string | undefined
   debounceMs?: number
   pollIntervalMs?: number
+  reconcileIntervalMs?: number
   readinessRetryMs?: number
   onOwnerChange?: () => void
   onError?: (error: unknown) => void
@@ -30,6 +31,7 @@ export function createDNSLifecycleMonitor(options: {
   let pollingOwner = false
   let physicalOwner = options.initialPhysicalOwner
   let ownerPollTimer: NodeJS.Timeout | undefined
+  let reconcilePollTimer: NodeJS.Timeout | undefined
   let reconcileTimer: NodeJS.Timeout | undefined
   let readinessRetryTimer: NodeJS.Timeout | undefined
   const debounceMs = options.debounceMs ?? 300
@@ -88,6 +90,7 @@ export function createDNSLifecycleMonitor(options: {
     ownerPollTimer = setInterval(() => {
       void pollPhysicalOwner()
     }, pollIntervalMs)
+    reconcilePollTimer = setInterval(schedule, options.reconcileIntervalMs ?? 15000)
     schedule()
     void pollPhysicalOwner()
   }
@@ -97,6 +100,10 @@ export function createDNSLifecycleMonitor(options: {
     if (ownerPollTimer) {
       clearInterval(ownerPollTimer)
       ownerPollTimer = undefined
+    }
+    if (reconcilePollTimer) {
+      clearInterval(reconcilePollTimer)
+      reconcilePollTimer = undefined
     }
     if (reconcileTimer) {
       clearTimeout(reconcileTimer)

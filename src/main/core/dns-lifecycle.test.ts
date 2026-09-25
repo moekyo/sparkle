@@ -6,13 +6,13 @@ import {
   type DNSLifecycleState,
   type DNSWriteMode
 } from './dns-lifecycle'
+import { sameDNSOwner, type DNSOwnerToken } from './dns-owner'
 
 function createDNSHarness(initialDNS: Record<string, string>, initialService = 'Wi-Fi') {
   let state: DNSLifecycleState = {}
   let defaultService = initialService
   let writeBehavior:
-    | ((service: string, dns: string, mode: DNSWriteMode) => Promise<void>)
-    | undefined
+    ((service: string, dns: string, mode: DNSWriteMode) => Promise<void>) | undefined
   const dnsByService = new Map(Object.entries(initialDNS))
   const writes: Array<{ service: string; dns: string; mode: DNSWriteMode }> = []
   const stateWrites: DNSLifecycleState[] = []
@@ -419,4 +419,39 @@ test('preserves manual DNS when recovering legacy ownership without a committed 
   assert.equal(harness.dnsByService.get('Wi-Fi'), '9.9.9.9')
   assert.deepEqual(harness.state, {})
   assert.equal(harness.writes.length, 0)
+})
+
+test('owner generation fences managed and guardian DNS writers in both handoff directions', async () => {
+  const appOwner: DNSOwnerToken = { kind: 'managed-app', generation: 'app-1' }
+  const guardianOwner: DNSOwnerToken = { kind: 'detached-guardian', generation: 'guardian-2' }
+  let currentOwner = appOwner
+  let state: DNSLifecycleState = {}
+  const dnsByService = new Map([['Wi-Fi', '1.1.1.1']])
+  const writes: string[] = []
+  const lifecycle = createDNSLifecycle({
+    readState: async () => ({ ...state }),
+    writeState: async (next) => {
+      state = { ...next }
+    },
+    getDefaultService: async () => 'Wi-Fi',
+    readDNS: async (service) => dnsByService.get(service) || 'Empty',
+    writeDNS: async (service, dns) => {
+      writes.push(dns)
+      dnsByService.set(service, dns)
+    },
+    isOwnerCurrent: async (owner) => sameDNSOwner(owner, currentOwner)
+  })
+
+  assert.equal(await lifecycle.apply('127.0.0.1', 'exec', appOwner), true)
+  currentOwner = guardianOwner
+  assert.equal(await lifecycle.apply('127.0.0.2', 'exec', appOwner), false)
+  assert.equal(await lifecycle.recover('exec', appOwner), false)
+  assert.equal(dnsByService.get('Wi-Fi'), '127.0.0.1')
+
+  assert.equal(await lifecycle.apply('127.0.0.2', 'exec', guardianOwner), true)
+  currentOwner = { kind: 'managed-app', generation: 'app-3' }
+  assert.equal(await lifecycle.apply('127.0.0.3', 'exec', guardianOwner), false)
+  assert.equal(await lifecycle.recover('exec', guardianOwner), false)
+  assert.equal(dnsByService.get('Wi-Fi'), '127.0.0.2')
+  assert.deepEqual(writes, ['127.0.0.1', '127.0.0.2'])
 })

@@ -41,7 +41,6 @@ import {
 } from '../config'
 import { app } from 'electron'
 import { startSSIDCheck } from '../sys/ssid'
-import { startNetworkDetection } from '../core/manager'
 import { initKeyManager } from '../service/manager'
 import { appendAppLog } from './log'
 
@@ -216,15 +215,11 @@ function runBackgroundInitTask(name: string, task: Promise<void>): void {
 }
 
 function startBackgroundInit(appConfig: AppConfig): void {
-  const { sysProxy, onlyActiveDevice = false, networkDetection = false } = appConfig
+  const { sysProxy, onlyActiveDevice = false } = appConfig
 
   runBackgroundInitTask('substore frontend', startSubStoreFrontendServer())
   runBackgroundInitTask('substore backend', startSubStoreBackendServer())
   runBackgroundInitTask('ssid check', startSSIDCheck())
-
-  if (networkDetection) {
-    runBackgroundInitTask('network detection', startNetworkDetection())
-  }
 
   runBackgroundInitTask(
     'sysproxy restore',

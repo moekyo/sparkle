@@ -46,10 +46,18 @@ test('keeps DNS ownership through detached readiness and hands it to the new res
   const started = deferred<void>()
   const ready = deferred<void>()
   const handoff = runDetachedCoreDNSHandoff({
+    prepareDetachedCore: async () => {
+      events.push('prepare-detached')
+      return { prepared: true }
+    },
+    prepareGuardian: async () => {
+      events.push('prepare-guardian')
+    },
     stopManagedCorePreservingDNS: async () => {
       events.push('stop-managed-preserve')
     },
-    startDetachedCore: async () => {
+    startDetachedCore: async (prepared) => {
+      assert.deepEqual(prepared, { prepared: true })
       events.push('start-detached')
       started.resolve()
       await ready.promise
@@ -60,10 +68,21 @@ test('keeps DNS ownership through detached readiness and hands it to the new res
       await ownedDNS.lifecycle.apply('127.0.0.2', 'exec')
       return { kind: 'applied' as const, target: '127.0.0.2' }
     },
+    registerGuardian: async () => {
+      events.push('guardian-ready')
+    },
     stopDetachedCorePreservingDNS: async () => {
       events.push('stop-detached')
     },
-    recoverDNS: () => ownedDNS.lifecycle.recover(),
+    recoverDNS: async () => {
+      await ownedDNS.lifecycle.recover()
+    },
+    revokeGuardian: async () => {
+      events.push('guardian-revoked')
+    },
+    rollbackManagedCore: async () => {
+      events.push('rollback-managed')
+    },
     commitHandoff: async () => {
       events.push('commit')
     }
@@ -81,30 +100,43 @@ test('keeps DNS ownership through detached readiness and hands it to the new res
   assert.equal(ownedDNS.state.originDNS, '1.1.1.1 8.8.8.8')
   assert.equal(ownedDNS.state.appliedDNS, '127.0.0.2')
   assert.deepEqual(events, [
+    'prepare-detached',
+    'prepare-guardian',
     'stop-managed-preserve',
     'start-detached',
     'detached-ready',
     'reconcile-new-resolver',
+    'guardian-ready',
     'commit'
   ])
 })
 
-test('detached startup failure stops the replacement and restores the original DNS', async () => {
+test('detached startup failure stops replacement, restores DNS, and restarts managed core', async () => {
   const ownedDNS = createOwnedDNS()
   await ownedDNS.lifecycle.apply('127.0.0.1', 'exec')
   let stoppedReplacement = false
+  const events: string[] = []
 
   await assert.rejects(
     runDetachedCoreDNSHandoff({
+      prepareDetachedCore: async () => ({}),
+      prepareGuardian: async () => {},
       stopManagedCorePreservingDNS: async () => {},
       startDetachedCore: async () => {
         throw new Error('controller failed to start')
       },
       reconcileDNS: async () => ({ kind: 'not-ready' as const }),
+      registerGuardian: async () => {},
       stopDetachedCorePreservingDNS: async () => {
         stoppedReplacement = true
       },
-      recoverDNS: () => ownedDNS.lifecycle.recover(),
+      recoverDNS: async () => {
+        await ownedDNS.lifecycle.recover()
+      },
+      revokeGuardian: async () => {},
+      rollbackManagedCore: async () => {
+        events.push('managed-restarted-and-reconciled')
+      },
       commitHandoff: async () => {}
     }),
     /controller failed to start/
@@ -113,6 +145,122 @@ test('detached startup failure stops the replacement and restores the original D
   assert.equal(stoppedReplacement, true)
   assert.equal(ownedDNS.dnsByService.get('Wi-Fi'), '1.1.1.1 8.8.8.8')
   assert.deepEqual(ownedDNS.state, {})
+  assert.deepEqual(events, ['managed-restarted-and-reconciled'])
+})
+
+test('handoff prepares the replacement while the managed core is alive', async () => {
+  let managedAlive = true
+  const events: string[] = []
+
+  await runDetachedCoreDNSHandoff({
+    prepareDetachedCore: async () => {
+      assert.equal(managedAlive, true)
+      events.push('network-preflight')
+      return 'prepared-profile'
+    },
+    prepareGuardian: async () => {
+      events.push('prepare-guardian')
+    },
+    stopManagedCorePreservingDNS: async () => {
+      managedAlive = false
+      events.push('stop-managed')
+    },
+    startDetachedCore: async (prepared) => {
+      assert.equal(prepared, 'prepared-profile')
+      events.push('spawn-prepared')
+    },
+    reconcileDNS: async () => ({ kind: 'applied', target: '127.0.0.1' }),
+    registerGuardian: async () => {
+      events.push('guardian-ready')
+    },
+    stopDetachedCorePreservingDNS: async () => {},
+    recoverDNS: async () => {},
+    revokeGuardian: async () => {},
+    rollbackManagedCore: async () => {},
+    commitHandoff: async () => {
+      events.push('commit')
+    }
+  })
+
+  assert.deepEqual(events, [
+    'network-preflight',
+    'prepare-guardian',
+    'stop-managed',
+    'spawn-prepared',
+    'guardian-ready',
+    'commit'
+  ])
+})
+
+test('handoff rolls back when required DNS ownership was not applied', async () => {
+  const events: string[] = []
+
+  await assert.rejects(
+    runDetachedCoreDNSHandoff({
+      prepareDetachedCore: async () => ({ requiresDNS: true }),
+      requiresDNS: (prepared) => prepared.requiresDNS,
+      prepareGuardian: async () => {},
+      stopManagedCorePreservingDNS: async () => {},
+      startDetachedCore: async () => {},
+      reconcileDNS: async () => ({ kind: 'recovered' }),
+      registerGuardian: async () => {},
+      stopDetachedCorePreservingDNS: async () => {
+        events.push('stop-replacement')
+      },
+      recoverDNS: async () => {
+        events.push('recover-origin')
+      },
+      revokeGuardian: async () => {},
+      rollbackManagedCore: async () => {
+        events.push('restart-managed')
+      },
+      commitHandoff: async () => {
+        events.push('commit')
+      }
+    }),
+    /DNS resolver did not become ready/
+  )
+
+  assert.deepEqual(events, ['stop-replacement', 'recover-origin', 'restart-managed'])
+})
+
+test('failed replacement rolls back managed core and surfaces rollback errors', async () => {
+  const original = new Error('detached startup failed')
+  const rollback = new Error('managed restart failed')
+  let replacementStopped = false
+  let originRecovered = false
+
+  await assert.rejects(
+    runDetachedCoreDNSHandoff({
+      prepareDetachedCore: async () => ({}),
+      prepareGuardian: async () => {},
+      stopManagedCorePreservingDNS: async () => {},
+      startDetachedCore: async () => {
+        throw original
+      },
+      reconcileDNS: async () => ({ kind: 'not-ready' }),
+      registerGuardian: async () => {},
+      stopDetachedCorePreservingDNS: async () => {
+        replacementStopped = true
+      },
+      recoverDNS: async () => {
+        originRecovered = true
+      },
+      revokeGuardian: async () => {},
+      rollbackManagedCore: async () => {
+        throw rollback
+      },
+      commitHandoff: async () => {}
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError)
+      assert.deepEqual(error.errors, [original, rollback])
+      return true
+    }
+  )
+
+  assert.equal(replacementStopped, true)
+  assert.equal(originRecovered, true)
 })
 
 test('controller readiness timeout is non-fatal and defers normal DNS reconciliation', async () => {

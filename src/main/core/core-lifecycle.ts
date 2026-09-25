@@ -25,9 +25,10 @@ export async function waitForControllerReady(
   const timeoutMs = options.timeoutMs ?? maxRetries * retryIntervalMs + 1000
   const delay =
     options.delay ??
-    ((ms) => new Promise<void>((resolve) => {
-      setTimeout(() => resolve(), ms)
-    }))
+    ((ms) =>
+      new Promise<void>((resolve) => {
+        setTimeout(() => resolve(), ms)
+      }))
 
   return new Promise((resolve) => {
     let settled = false
@@ -79,41 +80,92 @@ export async function reconcileDNSWhenControllerReady(
   }
 }
 
-export async function runDetachedCoreDNSHandoff(dependencies: {
+export async function runDetachedCoreDNSHandoff<PreparedCore>(dependencies: {
+  prepareDetachedCore: () => Promise<PreparedCore>
+  requiresDNS?: (prepared: PreparedCore) => boolean
+  prepareGuardian: () => Promise<void>
   stopManagedCorePreservingDNS: () => Promise<void>
-  startDetachedCore: () => Promise<void>
+  startDetachedCore: (prepared: PreparedCore) => Promise<void>
   reconcileDNS: () => Promise<DNSReconcileOutcome>
+  registerGuardian: () => Promise<void>
   stopDetachedCorePreservingDNS: () => Promise<void>
   recoverDNS: () => Promise<void>
+  revokeGuardian: () => Promise<void>
+  rollbackManagedCore: () => Promise<void>
+  clearHandoffArtifacts?: () => Promise<void>
   commitHandoff: () => Promise<void>
   onCleanupError?: (error: unknown) => void
 }): Promise<void> {
-  let managedCoreStopped = false
+  let managedCoreStopAttempted = false
   let detachedStartAttempted = false
+  let guardianPreparationAttempted = false
   try {
+    const prepared = await dependencies.prepareDetachedCore()
+    guardianPreparationAttempted = true
+    await dependencies.prepareGuardian()
+    managedCoreStopAttempted = true
     await dependencies.stopManagedCorePreservingDNS()
-    managedCoreStopped = true
     detachedStartAttempted = true
-    await dependencies.startDetachedCore()
+    await dependencies.startDetachedCore(prepared)
     const outcome = await dependencies.reconcileDNS()
-    if (outcome.kind === 'not-ready' || outcome.kind === 'stale') {
+    if (
+      outcome.kind === 'not-ready' ||
+      outcome.kind === 'stale' ||
+      (dependencies.requiresDNS?.(prepared) && outcome.kind !== 'applied')
+    ) {
       throw new Error('DNS resolver did not become ready for detached core handoff')
     }
+    await dependencies.registerGuardian()
     await dependencies.commitHandoff()
   } catch (error) {
-    if (managedCoreStopped) {
-      if (detachedStartAttempted) {
+    if (!managedCoreStopAttempted) {
+      if (guardianPreparationAttempted) {
         try {
-          await dependencies.stopDetachedCorePreservingDNS()
-        } catch (cleanupError) {
-          dependencies.onCleanupError?.(cleanupError)
+          await dependencies.revokeGuardian()
+        } catch (rollbackError) {
+          dependencies.onCleanupError?.(rollbackError)
+          throw new AggregateError(
+            [error, rollbackError],
+            'Detached DNS guardian preparation failed'
+          )
         }
       }
+      throw error
+    }
+
+    const rollbackErrors: unknown[] = []
+    const attemptRollback = async (rollback: () => Promise<void>): Promise<void> => {
+      try {
+        await rollback()
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError)
+        dependencies.onCleanupError?.(rollbackError)
+      }
+    }
+
+    if (guardianPreparationAttempted) {
+      await attemptRollback(dependencies.revokeGuardian)
+    }
+    if (detachedStartAttempted) {
+      await attemptRollback(dependencies.stopDetachedCorePreservingDNS)
+    }
+    if (dependencies.clearHandoffArtifacts) {
+      await attemptRollback(dependencies.clearHandoffArtifacts)
+    }
+    await attemptRollback(dependencies.recoverDNS)
+    await attemptRollback(dependencies.rollbackManagedCore)
+
+    if (rollbackErrors.length > 0) {
       try {
         await dependencies.recoverDNS()
-      } catch (cleanupError) {
-        dependencies.onCleanupError?.(cleanupError)
+      } catch (recoveryError) {
+        rollbackErrors.push(recoveryError)
+        dependencies.onCleanupError?.(recoveryError)
       }
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        'Detached core handoff and rollback failed'
+      )
     }
     throw error
   }

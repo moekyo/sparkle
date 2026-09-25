@@ -1,5 +1,6 @@
-import type { ChildProcess } from 'child_process'
+import { execFileSync, type ChildProcess } from 'child_process'
 import { appendAppLog } from '../utils/log'
+import { createOwnedProcessControl } from './owned-process-control'
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -77,5 +78,48 @@ export async function stopChildProcess(process: ChildProcess): Promise<void> {
       resolveOnce()
     }, 6000)
     timers.push(timer2)
+  })
+}
+
+export function processIsAlive(pid: number): boolean {
+  try {
+    globalThis.process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+export function readProcessIdentity(pid: number): string | undefined {
+  try {
+    return (
+      execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8' }).trim() ||
+      undefined
+    )
+  } catch {
+    return undefined
+  }
+}
+
+export function isProcessCommandMatching(pid: number, fragment: string): boolean {
+  try {
+    const command = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8'
+    })
+    return command.includes(fragment)
+  } catch {
+    return false
+  }
+}
+
+export function systemOwnedProcessControl() {
+  return createOwnedProcessControl({
+    isAlive: async (pid, identity) => processIsAlive(pid) && readProcessIdentity(pid) === identity,
+    sendSignal: (pid, signal) => process.kill(pid, signal),
+    delay: async (ms) => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, ms)
+      })
+    }
   })
 }

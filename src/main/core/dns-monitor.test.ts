@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import {
-  createDNSLifecycleMonitor,
-  registerDNSResumeReconciliation
-} from './dns-monitor'
+import { createDNSLifecycleMonitor, registerDNSResumeReconciliation } from './dns-monitor'
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -62,6 +59,26 @@ test('physical network owner changes schedule a debounced DNS reconciliation', a
   monitor.stop()
 
   assert.equal(reconciliations, 1)
+})
+
+test('periodically reconciles runtime DNS changes without network detection', async () => {
+  let reconciliations = 0
+  const monitor = createDNSLifecycleMonitor({
+    reconcile: async () => {
+      reconciliations++
+    },
+    getPhysicalOwner: async () => 'Wi-Fi',
+    initialPhysicalOwner: 'Wi-Fi',
+    debounceMs: 1,
+    pollIntervalMs: 1000,
+    reconcileIntervalMs: 8
+  })
+
+  monitor.start()
+  await delay(25)
+  monitor.stop()
+
+  assert.ok(reconciliations >= 2)
 })
 
 test('owner changes invalidate in-flight decisions and not-ready reconciliation retries', async () => {
