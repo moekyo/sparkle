@@ -27,11 +27,12 @@ import {
 import { shouldSkipServiceUnavailableFallback } from '../service/fallback'
 import { appendAppLog, setMihomoLogSource } from '../utils/log'
 import { showNotification } from '../utils/notification'
+import type { CoreStartOptions } from './core-lifecycle'
 
 interface ServiceCoreRuntimeOptions {
   notifyCoreLog: (source: ServiceCoreEvent) => void
   resetDirectCoreRetry: () => void
-  startCore: (detached?: boolean) => Promise<Promise<void>[]>
+  startCore: (options?: CoreStartOptions) => Promise<Promise<void>[]>
 }
 
 export function createServiceCoreRuntime(options: ServiceCoreRuntimeOptions) {
@@ -127,7 +128,7 @@ export function createServiceCoreRuntime(options: ServiceCoreRuntimeOptions) {
   }
 
   async function fallbackToElevatedCore(
-    detached: boolean,
+    startOptions: CoreStartOptions,
     reason: unknown
   ): Promise<Promise<void>[]> {
     await appendAppLog(`[Manager]: Service unavailable, fallback to elevated core, ${reason}\n`)
@@ -136,7 +137,7 @@ export function createServiceCoreRuntime(options: ServiceCoreRuntimeOptions) {
     mainWindow?.webContents.send('appConfigUpdated')
     floatingWindow?.webContents.send('appConfigUpdated')
     void showNotification({ title: '服务不可用，已切换到非服务模式' })
-    return options.startCore(detached)
+    return options.startCore(startOptions)
   }
 
   async function fallbackUnavailableServiceModes(reason: unknown): Promise<void> {

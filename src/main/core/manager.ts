@@ -46,8 +46,14 @@ import {
 } from '../utils/notification'
 import { createCoreHookWaiter, createCoreStartupHook } from './startupHook'
 import { stopChildProcess } from './process-control'
-import { reconcileSystemDNS, recoverDNS, startNetworkDetectionController } from './network'
-import { runAfterCoreReady } from './dns-lifecycle'
+import {
+  capturePhysicalNetworkOwner,
+  reconcileSystemDNS,
+  recoverDNS,
+  startDNSReconciliationMonitor,
+  startNetworkDetectionController,
+  stopDNSReconciliationMonitor
+} from './network'
 import { checkProfile } from './profile-check'
 import {
   createCoreEnvironment,
@@ -59,6 +65,13 @@ import {
   isUpdaterFinishedLog
 } from './startup-chain'
 import { createServiceCoreRuntime } from './service-core-runtime'
+import {
+  reconcileDNSWhenControllerReady,
+  runDetachedCoreDNSHandoff,
+  waitForControllerReady,
+  type CoreStartOptions,
+  type CoreStopOptions
+} from './core-lifecycle'
 
 const ctlParam = process.platform === 'win32' ? '-ext-ctl-pipe' : '-ext-ctl-unix'
 
@@ -68,6 +81,7 @@ const directCoreLogLineLimit = 16 * 1024
 
 const directCoreState = {
   child: undefined as ChildProcess | undefined,
+  detached: false,
   retry: 10,
   logLineBuffer: ''
 }
@@ -77,7 +91,7 @@ const serviceCoreRuntime = createServiceCoreRuntime({
   resetDirectCoreRetry: () => {
     directCoreState.retry = 10
   },
-  startCore: (detached) => startCore(detached)
+  startCore: (options) => startCore(options)
 })
 
 type CoreLogNotification = AppNotificationPayload & {
@@ -235,36 +249,45 @@ async function completeCoreInitialization(logLevel?: LogLevel): Promise<void> {
   ]
 
   if (logLevel) {
-    tasks.push(delay(100).then(() => patchMihomoConfig({ 'log-level': logLevel })))
+    tasks.push(
+      delay(100)
+        .then(() => patchMihomoConfig({ 'log-level': logLevel }))
+        .catch((error) =>
+          appendAppLog(`[Manager]: update core log level failed, ${error}\n`).catch(() => {})
+        )
+    )
   }
 
-  await Promise.all(tasks)
   setMihomoLogSource('ws')
-  await runAfterCoreReady(waitForMihomoReady, async () => {
-    try {
-      await reconcileSystemDNS()
-    } catch (error) {
-      await appendAppLog(`[Manager]: set dns failed, ${error}\n`)
+  void Promise.all(tasks).catch((error) => {
+    appendAppLog(`[Manager]: post-start tasks failed, ${error}\n`).catch(() => {})
+  })
+  await reconcileDNSWhenControllerReady(
+    waitForMihomoReady,
+    reconcileSystemDNS,
+    (error) => {
+      appendAppLog(
+        error
+          ? `[Manager]: DNS reconcile deferred, ${error}\n`
+          : '[Manager]: controller not ready; DNS reconcile deferred\n'
+      ).catch(() => {})
     }
+  )
+  startDNSReconciliationMonitor()
+}
+
+async function waitForMihomoReady(): Promise<boolean> {
+  return waitForControllerReady(() => mihomoGroups(), {
+    maxRetries: 30,
+    retryIntervalMs: 100,
+    delay
   })
 }
 
-async function waitForMihomoReady(): Promise<void> {
-  const maxRetries = 30
-  const retryInterval = 100
-  let lastError: unknown
-
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      await mihomoGroups()
-      return
-    } catch (error) {
-      lastError = error
-      await delay(retryInterval)
-    }
-  }
-
-  throw new Error(`Mihomo did not become ready: ${lastError}`)
+function startMihomoApiStreamsBestEffort(): void {
+  startMihomoApiStreams().catch((error) => {
+    appendAppLog(`[Manager]: start controller streams deferred, ${error}\n`).catch(() => {})
+  })
 }
 
 async function waitForServiceCoreConnection(
@@ -333,7 +356,9 @@ async function getServiceStatusAfterConnectionError(): Promise<
   }
 }
 
-export async function startCore(detached = false): Promise<Promise<void>[]> {
+export async function startCore(options: CoreStartOptions = {}): Promise<Promise<void>[]> {
+  const detached = options.mode === 'detached'
+  const preserveDNSOwnership = options.dnsOwnership === 'preserve' || detached
   const [appConfig, controlledMihomoConfig, profileConfig] = await Promise.all([
     getAppConfig(),
     getControledMihomoConfig(),
@@ -365,7 +390,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
   } catch (error) {
     if (core === 'system' && !systemCoreOnlyBuild) {
       await patchAppConfig({ core: 'mihomo' })
-      return startCore(detached)
+      return startCore(options)
     }
     throw error
   }
@@ -373,6 +398,11 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
   await generateProfile()
   if (useServiceCore || detached) {
     await checkProfile()
+  }
+  try {
+    await capturePhysicalNetworkOwner()
+  } catch (error) {
+    await appendAppLog(`[Manager]: capture physical network owner failed, ${error}\n`)
   }
   let serviceCoreRunning = false
   if (useServiceCore) {
@@ -383,14 +413,16 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
       if (isServiceUnavailableError(error)) {
         const probe = await waitForServiceCoreConnection(error)
         if (!probe.reachable) {
-          return serviceCoreRuntime.fallbackToElevatedCore(detached, probe.error)
+          return serviceCoreRuntime.fallbackToElevatedCore(options, probe.error)
         }
         serviceCoreRunning = probe.running
       }
     }
   }
-  if (!serviceCoreRunning) {
-    await stopCore()
+  if (!serviceCoreRunning && options.existingCore !== 'already-stopped') {
+    await stopCore({ dnsOwnership: preserveDNSOwnership ? 'preserve' : 'restore' })
+  } else if (options.existingCore === 'already-stopped') {
+    stopDNSReconciliationMonitor()
   }
   setMihomoLogSource('out')
   const env = createCoreEnvironment({
@@ -450,7 +482,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
       if (isServiceUnavailableError(error)) {
         const probe = await waitForServiceCoreConnection(error)
         if (!probe.reachable) {
-          return serviceCoreRuntime.fallbackToElevatedCore(detached, probe.error)
+          return serviceCoreRuntime.fallbackToElevatedCore(options, probe.error)
         }
         await serviceCoreRuntime.startEventStream()
         if (!probe.running) {
@@ -463,7 +495,9 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
     } finally {
       serviceCoreRuntime.endStartup()
     }
-    await serviceCoreRuntime.ensureStreamsStarted()
+    void serviceCoreRuntime.ensureStreamsStarted().catch((error) => {
+      appendAppLog(`[Manager]: start service core streams deferred, ${error}\n`).catch(() => {})
+    })
     initialized = true
     return [completeCoreInitialization(logLevel)]
   }
@@ -479,6 +513,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
     env: env
   })
   directCoreState.child = child
+  directCoreState.detached = detached
   let startupOutput = ''
   let configurationRejected = false
   let spawnError: Error | undefined
@@ -511,11 +546,55 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
   }
   if (detached) {
     child.unref()
-    return new Promise((resolve) => {
-      resolve([new Promise(() => {})])
+    child.once('close', async (code, signal) => {
+      const wasCurrentDetachedCore =
+        directCoreState.child === child && directCoreState.detached
+      if (directCoreState.child === child) {
+        directCoreState.child = undefined
+        directCoreState.detached = false
+      }
+      if (wasCurrentDetachedCore) {
+        await appendAppLog(`[Manager]: Detached core closed, code: ${code}, signal: ${signal}\n`)
+        try {
+          await recoverDNS()
+        } catch (error) {
+          await appendAppLog(`[Manager]: recover dns after detached core exit failed, ${error}\n`)
+        }
+      }
     })
+    const childExited = new Promise<never>((_resolve, reject) => {
+      child.once('close', (code, signal) => {
+        reject(startupFailure(`code: ${code}, signal: ${signal}`))
+      })
+    })
+    const controllerReady = waitForControllerReady(() => mihomoGroups(), {
+      maxRetries: 100,
+      retryIntervalMs: 100,
+      timeoutMs: 12000,
+      delay
+    }).then((ready) => {
+      if (!ready) throw startupFailure('Mihomo controller did not become ready')
+      if (spawnError || child.exitCode !== null || child.signalCode !== null) {
+        throw startupFailure(spawnError || 'Detached core exited before becoming ready')
+      }
+    })
+    await Promise.race([controllerReady, childExited])
+    if (directCoreState.child !== child || child.exitCode !== null || child.signalCode !== null) {
+      throw startupFailure('Detached core exited before DNS handoff')
+    }
+    if (options.reconcileDNSAfterReady !== false) {
+      const outcome = await reconcileSystemDNS()
+      if (outcome.kind === 'not-ready' || outcome.kind === 'stale') {
+        throw startupFailure(`DNS resolver is not ready: ${outcome.kind}`)
+      }
+    }
+    return []
   }
-  child.on('close', async (code, signal) => {
+  child.once('close', async (code, signal) => {
+    if (directCoreState.child === child) {
+      directCoreState.child = undefined
+      directCoreState.detached = false
+    }
     flushDirectCoreLogNotifications()
     await appendAppLog(`[Manager]: Core closed, code: ${code}, signal: ${signal}\n`)
     if (!configurationRejected && directCoreState.retry) {
@@ -585,8 +664,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
 
           if (!controllerReady || !providersReady || completing) return
           completing = true
-          await startMihomoApiStreams()
-          await waitForMihomoReady()
+          startMihomoApiStreamsBestEffort()
           initialized = true
           resolve([completeCoreInitialization(logLevel)])
         }
@@ -606,7 +684,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
       hookWaiter.promise
         .then(async () => {
           initialized = true
-          await startMihomoApiStreams()
+          startMihomoApiStreamsBestEffort()
           resolve([completeCoreInitialization(logLevel)])
         })
         .catch((error) => reject(startupFailure(error)))
@@ -616,13 +694,16 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
   return coreStartupMode === 'post-up' ? waitForCoreReadyByHook() : waitForCoreReadyByLog()
 }
 
-export async function stopCore(): Promise<void> {
+export async function stopCore(options: CoreStopOptions = {}): Promise<void> {
+  stopDNSReconciliationMonitor()
   serviceCoreRuntime.pauseAutoResume()
 
-  try {
-    await recoverDNS()
-  } catch (error) {
-    await appendAppLog(`[Manager]: recover dns failed, ${error}\n`)
+  if (options.dnsOwnership !== 'preserve') {
+    try {
+      await recoverDNS()
+    } catch (error) {
+      await appendAppLog(`[Manager]: recover dns failed, ${error}\n`)
+    }
   }
 
   serviceCoreRuntime.clearStreams()
@@ -643,6 +724,7 @@ export async function stopCore(): Promise<void> {
   const child = directCoreState.child
   if (child) {
     directCoreState.child = undefined
+    directCoreState.detached = false
     await stopChildProcess(child)
   }
 
@@ -754,23 +836,45 @@ export async function restartCore(): Promise<void> {
 }
 
 export async function keepCoreAlive(): Promise<void> {
-  try {
-    const { corePermissionMode = 'elevated' } = await getAppConfig()
-    if (corePermissionMode === 'service') {
-      return
-    }
+  const { corePermissionMode = 'elevated' } = await getAppConfig()
+  if (corePermissionMode === 'service') return
 
-    await startCore(true)
-    if (directCoreState.child?.pid) {
-      await writeFile(path.join(dataDir(), 'core.pid'), directCoreState.child.pid.toString())
+  await runDetachedCoreDNSHandoff({
+    stopManagedCorePreservingDNS: () => stopCore({ dnsOwnership: 'preserve' }),
+    startDetachedCore: async () => {
+      const promises = await startCore({
+        mode: 'detached',
+        dnsOwnership: 'preserve',
+        existingCore: 'already-stopped',
+        reconcileDNSAfterReady: false
+      })
+      await Promise.all(promises)
+    },
+    reconcileDNS: async () => {
+      if (!directCoreState.detached || !directCoreState.child) return { kind: 'not-ready' }
+      const outcome = await reconcileSystemDNS()
+      return directCoreState.detached && directCoreState.child ? outcome : { kind: 'not-ready' }
+    },
+    stopDetachedCorePreservingDNS: () => stopCore({ dnsOwnership: 'preserve' }),
+    recoverDNS,
+    commitHandoff: async () => {
+      const pid = directCoreState.child?.pid
+      if (!pid || !directCoreState.detached) throw new Error('Detached core exited before handoff')
+      await writeFile(path.join(dataDir(), 'core.pid'), pid.toString())
+    },
+    onCleanupError: (error) => {
+      appendAppLog(`[Manager]: detached core handoff cleanup failed, ${error}\n`).catch(() => {})
     }
-  } catch (e) {
-    void showNotification({ title: '内核启动出错', body: `${e}`, variant: 'danger' })
-  }
+  })
 }
 
 export async function quitWithoutCore(): Promise<void> {
-  await keepCoreAlive()
+  try {
+    await keepCoreAlive()
+  } catch (error) {
+    void showNotification({ title: '内核启动出错', body: `${error}`, variant: 'danger' })
+    return
+  }
   await startMonitor(true)
   app.exit()
 }

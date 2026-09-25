@@ -102,6 +102,7 @@ interface AppConfig {
   appliedDNS?: string
   targetService?: string
   appliedDNSMode?: 'exec' | 'service'
+  dnsOwnershipPhase?: 'applying' | 'applied' | 'restoring'
   useWindowFrame: boolean
   enableWindowDrag: boolean
   proxyInTray: boolean

@@ -62,7 +62,7 @@ import {
   subStorePort
 } from '../resolve/server'
 import { quitWithoutCore, restartCore, startNetworkDetection, stopCore } from '../core/manager'
-import { stopNetworkDetection } from '../core/network'
+import { scheduleDNSReconciliation, stopNetworkDetection } from '../core/network'
 import {
   checkCorePermission,
   manualGrantCorePermition,
@@ -165,6 +165,7 @@ function ipcErrorWrapper<T>( // eslint-disable-next-line @typescript-eslint/no-e
 
 async function patchAppConfigWithServiceSync(patch: Partial<AppConfig>): Promise<AppConfig> {
   const nextConfig = await patchAppConfig(await normalizeServiceModePatch(patch))
+  if ('autoSetDNSMode' in patch) scheduleDNSReconciliation()
 
   if (!('saveLogs' in patch || 'maxLogFileSizeMB' in patch || 'serviceCpuAffinity' in patch)) {
     return nextConfig

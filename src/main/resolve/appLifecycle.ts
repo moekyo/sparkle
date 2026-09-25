@@ -1,6 +1,11 @@
 import { app, ipcMain, powerMonitor, type BrowserWindow, type IpcMainEvent } from 'electron'
 import { stopCore } from '../core/manager'
-import { stopNetworkDetection } from '../core/network'
+import {
+  scheduleDNSReconciliation,
+  stopDNSReconciliationMonitor,
+  stopNetworkDetection
+} from '../core/network'
+import { registerDNSResumeReconciliation } from '../core/dns-monitor'
 import { disableSysProxySync, triggerSysProxy } from '../sys/sysproxy'
 import { appendAppLog } from '../utils/log'
 
@@ -20,6 +25,12 @@ export function setNotQuitDialog(): void {
 }
 
 export function initAppQuitLifecycle(context: AppQuitLifecycleContext): void {
+  registerDNSResumeReconciliation(
+    powerMonitor,
+    () => !isQuitting && !notQuitDialog,
+    scheduleDNSReconciliation
+  )
+
   app.on('window-all-closed', () => {
     // Don't quit app when all windows are closed
   })
@@ -63,6 +74,7 @@ async function quit(context: AppQuitLifecycleContext): Promise<void> {
 }
 
 async function cleanupBeforeExit(useRegistry: boolean): Promise<void> {
+  stopDNSReconciliationMonitor()
   try {
     await stopNetworkDetection()
   } catch (error) {

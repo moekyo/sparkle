@@ -2,12 +2,14 @@ import { isIP } from 'node:net'
 
 export type DNSSettingMode = 'none' | 'exec' | 'service'
 export type DNSWriteMode = Exclude<DNSSettingMode, 'none'>
+export type DNSOwnershipPhase = 'applying' | 'applied' | 'restoring'
 
 export interface DNSLifecycleState {
   originDNS?: string
   appliedDNS?: string
   targetService?: string
   appliedDNSMode?: DNSWriteMode
+  phase?: DNSOwnershipPhase
 }
 
 interface DNSLifecycleDependencies {
@@ -135,13 +137,6 @@ export function resolveSystemDnsTarget(
   return getHijackedResolverAddress(hijack) || getTunResolverAddress(tunStatus)
 }
 
-export function runAfterCoreReady(
-  waitUntilReady: () => Promise<void>,
-  operation: () => Promise<void>
-): Promise<void> {
-  return waitUntilReady().then(operation)
-}
-
 export function createDNSLifecycle(dependencies: DNSLifecycleDependencies): {
   apply: (target: string, mode: DNSSettingMode) => Promise<void>
   recover: (mode?: DNSSettingMode) => Promise<void>
@@ -160,40 +155,101 @@ export function createDNSLifecycle(dependencies: DNSLifecycleDependencies): {
   const hasState = (state: DNSLifecycleState): boolean =>
     state.originDNS !== undefined ||
     state.appliedDNS !== undefined ||
-    state.targetService !== undefined
+    state.targetService !== undefined ||
+    state.phase !== undefined
 
-  const restoreState = async (state: DNSLifecycleState, mode: DNSSettingMode): Promise<void> => {
-    if (state.originDNS === undefined) return
+  const clearState = (): Promise<void> => dependencies.writeState({})
 
-    const service = state.targetService || (await dependencies.getDefaultService())
-    const currentDNS = normalizeDNS(await dependencies.readDNS(service))
-    if (state.appliedDNS !== undefined && !dnsValuesEqual(currentDNS, state.appliedDNS)) return
+  const writeDNSAndVerify = async (
+    service: string,
+    dns: string,
+    modes: Iterable<DNSWriteMode>
+  ): Promise<DNSWriteMode> => {
+    let lastError: unknown
+    for (const writeMode of modes) {
+      let writeError: unknown
+      try {
+        await dependencies.writeDNS(service, dns, writeMode)
+      } catch (error) {
+        writeError = error
+      }
 
+      try {
+        if (dnsValuesEqual(await dependencies.readDNS(service), dns)) return writeMode
+        lastError = writeError ?? new Error(`DNS write verification failed for service ${service}`)
+      } catch (error) {
+        lastError = writeError ?? error
+      }
+    }
+    throw lastError ?? new Error(`DNS write verification failed for service ${service}`)
+  }
+
+  const restoreState = async (
+    state: DNSLifecycleState,
+    mode: DNSSettingMode
+  ): Promise<'restored' | 'origin' | 'external'> => {
+    if (!hasState(state)) return 'origin'
+    if (
+      state.originDNS === undefined ||
+      state.targetService === undefined ||
+      state.appliedDNS === undefined
+    ) {
+      await clearState()
+      return 'external'
+    }
+
+    const originDNS = state.originDNS
+    const appliedDNS = state.appliedDNS
+    const service = state.targetService
+    let currentDNS = normalizeDNS(await dependencies.readDNS(service))
+    if (state.phase === 'applying') {
+      if (!dnsValuesEqual(currentDNS, appliedDNS)) {
+        await clearState()
+        return dnsValuesEqual(currentDNS, originDNS) ? 'origin' : 'external'
+      }
+      state = { ...state, phase: 'applied' }
+      await dependencies.writeState(state)
+    } else if (state.phase === 'restoring') {
+      if (dnsValuesEqual(currentDNS, originDNS)) {
+        await clearState()
+        return 'origin'
+      }
+      if (!dnsValuesEqual(currentDNS, appliedDNS)) {
+        await clearState()
+        return 'external'
+      }
+      state = { ...state, phase: 'applied' }
+      await dependencies.writeState(state)
+    }
+
+    if (dnsValuesEqual(currentDNS, originDNS)) {
+      await clearState()
+      return 'origin'
+    }
+    if (!dnsValuesEqual(currentDNS, appliedDNS)) {
+      await clearState()
+      return 'external'
+    }
+
+    const restoringState = { ...state, phase: 'restoring' as const }
+    await dependencies.writeState(restoringState)
     const restoreModes = new Set<DNSWriteMode>([
       state.appliedDNSMode || (mode === 'service' ? 'service' : 'exec'),
       mode === 'service' ? 'service' : 'exec',
       'exec'
     ])
-    let lastError: unknown
-    for (const restoreMode of restoreModes) {
-      try {
-        await dependencies.writeDNS(service, state.originDNS, restoreMode)
-        return
-      } catch (error) {
-        lastError = error
-      }
+    await writeDNSAndVerify(service, originDNS, restoreModes)
+    currentDNS = normalizeDNS(await dependencies.readDNS(service))
+    if (!dnsValuesEqual(currentDNS, originDNS)) {
+      throw new Error(`DNS restore verification failed for service ${service}`)
     }
-    throw lastError
+    await clearState()
+    return 'restored'
   }
-
-  const clearState = (): Promise<void> => dependencies.writeState({})
 
   const recover = (mode: DNSSettingMode = 'none'): Promise<void> =>
     serialize(async () => {
-      const state = await dependencies.readState()
-      if (!hasState(state)) return
-      await restoreState(state, mode)
-      await clearState()
+      await restoreState(await dependencies.readState(), mode)
     })
 
   const apply = (target: string, mode: DNSSettingMode): Promise<void> =>
@@ -203,44 +259,87 @@ export function createDNSLifecycle(dependencies: DNSLifecycleDependencies): {
       let state = await dependencies.readState()
       if (
         hasState(state) &&
-        (state.originDNS === undefined || state.appliedDNS === undefined || !state.targetService)
+        (state.phase === 'applying' ||
+          state.phase === 'restoring' ||
+          state.originDNS === undefined ||
+          state.appliedDNS === undefined ||
+          state.targetService === undefined)
       ) {
-        await restoreState(state, mode)
-        await clearState()
+        const oldService = state.targetService
+        const recoveryResult = await restoreState(state, mode)
+        if (recoveryResult === 'external' && !oldService) return
+        if (recoveryResult === 'external') {
+          const currentService = await dependencies.getDefaultService()
+          if (currentService === oldService) return
+        }
         state = {}
       }
 
       let service = await dependencies.getDefaultService()
       if (state.targetService && state.targetService !== service) {
         await restoreState(state, mode)
-        await clearState()
         state = {}
         service = await dependencies.getDefaultService()
       }
 
       const currentDNS = normalizeDNS(await dependencies.readDNS(service))
+      const hasCommittedOwnership = state.phase === 'applied' || state.phase === undefined
+      const committedStateForService =
+        hasCommittedOwnership &&
+        state.targetService === service &&
+        state.originDNS !== undefined &&
+        state.appliedDNS !== undefined
+      if (
+        committedStateForService &&
+        !dnsValuesEqual(currentDNS, state.appliedDNS!) &&
+        !dnsValuesEqual(currentDNS, state.originDNS!)
+      ) {
+        await clearState()
+        return
+      }
       const previousStateIsApplied =
+        hasCommittedOwnership &&
         state.targetService === service &&
         state.originDNS !== undefined &&
         state.appliedDNS !== undefined &&
         dnsValuesEqual(currentDNS, state.appliedDNS)
       const originDNS = previousStateIsApplied ? state.originDNS! : currentDNS
       const normalizedTarget = normalizeDNS(target)
-      const appliedMode =
-        previousStateIsApplied && dnsValuesEqual(currentDNS, normalizedTarget)
-          ? state.appliedDNSMode || mode
-          : mode
+      const alreadyApplied = previousStateIsApplied && dnsValuesEqual(currentDNS, normalizedTarget)
 
-      await dependencies.writeState({
+      const applyingState: DNSLifecycleState = {
         originDNS,
         appliedDNS: normalizedTarget,
         targetService: service,
-        appliedDNSMode: appliedMode
-      })
-
-      if (!dnsValuesEqual(currentDNS, normalizedTarget)) {
-        await dependencies.writeDNS(service, normalizedTarget, mode)
+        appliedDNSMode: alreadyApplied ? state.appliedDNSMode || mode : mode,
+        phase: 'applying'
       }
+      await dependencies.writeState(applyingState)
+
+      let appliedMode = applyingState.appliedDNSMode!
+      if (!alreadyApplied) {
+        try {
+          appliedMode = await writeDNSAndVerify(
+            service,
+            normalizedTarget,
+            mode === 'service' ? ['service', 'exec'] : [mode]
+          )
+        } catch (error) {
+          const afterFailure = normalizeDNS(await dependencies.readDNS(service))
+          if (dnsValuesEqual(afterFailure, normalizedTarget)) {
+            await dependencies.writeState({ ...applyingState, appliedDNSMode: mode, phase: 'applied' })
+            return
+          }
+          await clearState()
+          throw error
+        }
+      }
+
+      await dependencies.writeState({
+        ...applyingState,
+        appliedDNSMode: appliedMode,
+        phase: 'applied'
+      })
     })
 
   return { apply, recover }
