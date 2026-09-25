@@ -163,3 +163,29 @@ test('a late old-service reconcile cannot undo a service-owner switch', async ()
     ]
   )
 })
+
+test('stop and restart on a new service cannot be undone by the pre-stop reconcile', async () => {
+  const harness = createReconcileHarness()
+  await harness.lifecycle.apply('127.0.0.9', 'exec')
+
+  const beforeStop = harness.reconciler.reconcile()
+  const oldProbe = await harness.waitForProbe('127.0.0.1')
+
+  await harness.reconciler.recover()
+  assert.equal(harness.dnsByService.get('Wi-Fi'), '1.1.1.1 8.8.8.8')
+
+  harness.setService('Ethernet')
+  harness.setTarget('127.0.0.2')
+  const afterRestart = harness.reconciler.reconcile()
+  const newProbe = await harness.waitForProbe('127.0.0.2')
+  newProbe.result.resolve(true)
+  await afterRestart
+
+  oldProbe.result.resolve(true)
+  await beforeStop
+
+  assert.equal(harness.dnsByService.get('Wi-Fi'), '1.1.1.1 8.8.8.8')
+  assert.equal(harness.dnsByService.get('Ethernet'), '127.0.0.2')
+  assert.equal(harness.state.targetService, 'Ethernet')
+  assert.equal(harness.state.appliedDNS, '127.0.0.2')
+})
